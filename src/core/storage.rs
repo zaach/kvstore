@@ -1,3 +1,4 @@
+use crate::util;
 use bytes::Bytes;
 use lru::LruCache;
 use serde::de::DeserializeOwned;
@@ -6,8 +7,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::RwLock;
 use thiserror;
-use crate::util;
 
 #[derive(thiserror::Error, Debug)]
 #[error(transparent)]
@@ -27,10 +30,6 @@ struct LogIndex {
     pos: u64,
 }
 
-trait LogWriter {
-    fn append<T: Serialize>(&mut self, entry: &T) -> Result<LogIndex, Error>;
-}
-
 struct FileLogWriter {
     writer: File,
 }
@@ -43,8 +42,7 @@ impl FileLogWriter {
         println!("FileLogWriter::new: path: {:?}", path);
         Ok(FileLogWriter { writer })
     }
-}
-impl LogWriter for FileLogWriter {
+
     fn append<T: Serialize>(&mut self, entry: &T) -> Result<LogIndex, Error> {
         println!("Serialized size: {:?}", bincode::serialized_size(entry)?);
         let buf = bincode::serialize(entry)?;
@@ -61,10 +59,6 @@ impl LogWriter for FileLogWriter {
     }
 }
 
-trait LogReader {
-    unsafe fn at<T: DeserializeOwned>(&mut self, len: u64, pos: u64) -> Result<T, Error>;
-}
-
 struct FileLogReader {
     reader: File,
 }
@@ -74,8 +68,8 @@ impl FileLogReader {
         let reader = std::fs::OpenOptions::new().read(true).open(path)?;
         Ok(FileLogReader { reader })
     }
-}
-impl LogReader for FileLogReader {
+
+    // TODO memmapped reader
     unsafe fn at<T: DeserializeOwned>(&mut self, len: u64, pos: u64) -> Result<T, Error> {
         println!("FileLogReader::at: len: {:?}, pos: {:?}", len, pos);
         self.reader.seek(SeekFrom::Start(pos))?;
@@ -87,9 +81,14 @@ impl LogReader for FileLogReader {
     }
 }
 
-struct LogDir<T: LogReader = FileLogReader>(LruCache<u64, T>);
+struct LogDir(LruCache<u64, FileLogReader>);
 
-impl LogDir<FileLogReader> {
+impl LogDir {
+    fn new() -> LogDir {
+        LogDir(LruCache::new(
+            std::num::NonZeroUsize::new(MAX_READER_CACHE).unwrap(),
+        ))
+    }
     unsafe fn read<T, P>(&mut self, path: P, fileid: u64, len: u64, pos: u64) -> Result<T, Error>
     where
         T: DeserializeOwned,
@@ -107,6 +106,11 @@ impl LogDir<FileLogReader> {
         reader.at(len, pos)
     }
 }
+impl Clone for LogDir {
+    fn clone(&self) -> Self {
+        LogDir::new()
+    }
+}
 
 type KeyDir = HashMap<Bytes, KeyDirEntry>;
 
@@ -118,7 +122,7 @@ struct KeyDirEntry {
     tstamp: i64,
 }
 
-pub trait KeyValueStorage: 'static {
+pub trait KeyValueStorage: Clone + Send + 'static {
     type Error: std::error::Error;
 
     fn set(&mut self, key: Bytes, value: Bytes) -> Result<(), Self::Error>;
@@ -128,37 +132,20 @@ pub trait KeyValueStorage: 'static {
     fn del(&mut self, key: Bytes) -> Result<bool, Self::Error>;
 }
 
+#[derive(Clone)]
 pub struct KVContext {
     logdir: LogDir,
-    keydir: KeyDir,
-    writer: FileLogWriter,
+    keydir: Arc<RwLock<KeyDir>>,
+    writer: Arc<Mutex<FileLogWriter>>,
     fileid: u64,
     path: PathBuf,
 }
 
-const MAX_READER_CACHE = std::num::NonZeroUsize::new(1024).unwrap();
+const MAX_READER_CACHE: usize = 1024;
 
 impl KVContext {
     pub fn new() -> Result<KVContext, Error> {
-        let mut path = std::env::current_dir()?;
-        path.push(".kvstore/data");
-        // create directory if not exists
-        std::fs::create_dir_all(&path)?;
-        println!("path: {:?}", path);
-        let fileid = 0;
-        let filepath = path.clone().join(fileid.to_string());
-        let writer = FileLogWriter::new(filepath.to_str().unwrap())?;
-        let keydir = HashMap::new();
-        let limit = MAX_READER_CACHE;
-        let logdir = LogDir(LruCache::new(limit));
-
-        Ok(KVContext {
-            logdir,
-            keydir,
-            writer,
-            fileid,
-            path,
-        })
+        KVContext::from_dir(None)
     }
 
     pub fn from_dir(data_dir: Option<&str>) -> Result<KVContext, Error> {
@@ -212,20 +199,20 @@ impl KVContext {
         println!("keydir: {:?}", keydir);
 
         let filepath = path.clone().join(fileid.to_string());
-        let writer = FileLogWriter::new(filepath.to_str().unwrap())?;
+        let writer = Arc::new(Mutex::new(FileLogWriter::new(filepath.to_str().unwrap())?));
 
-        let logdir = LogDir(LruCache::new(MAX_READER_CACHE));
+        let logdir = LogDir::new();
 
         Ok(KVContext {
             logdir,
-            keydir,
+            keydir: Arc::new(RwLock::new(keydir)),
             writer,
             fileid,
             path,
         })
     }
 
-    // TODO copaction
+    // TODO compaction
 }
 
 impl KeyValueStorage for KVContext {
@@ -240,8 +227,10 @@ impl KeyValueStorage for KVContext {
             key: key.clone(),
             value: Some(value),
         };
-        let index = self.writer.append(&entry)?;
-        self.keydir.insert(
+        let mut writer = self.writer.lock().unwrap();
+        let index = (*writer).append(&entry)?;
+        let mut keydir = self.keydir.write().unwrap();
+        keydir.insert(
             key,
             KeyDirEntry {
                 fileid: self.fileid,
@@ -254,7 +243,8 @@ impl KeyValueStorage for KVContext {
     }
 
     fn get(&mut self, key: Bytes) -> Result<Option<Bytes>, Self::Error> {
-        let entry = self.keydir.get(&key);
+        let keydir = self.keydir.read().unwrap();
+        let entry = keydir.get(&key);
         if entry.is_none() {
             return Ok(None);
         }
@@ -267,18 +257,22 @@ impl KeyValueStorage for KVContext {
     }
 
     fn del(&mut self, key: Bytes) -> Result<bool, Self::Error> {
-        let old_entry = self.keydir.get(&key);
+        let keydir = self.keydir.read().unwrap();
+        let old_entry = keydir.get(&key);
         if old_entry.is_none() {
             return Ok(false);
         }
+        drop(keydir);
         let tstamp = chrono::Utc::now().timestamp();
         let entry = DataFileEntry {
             tstamp,
             key: key.clone(),
             value: None,
         };
-        self.writer.append(&entry)?;
-        self.keydir.remove(&key);
+        let mut writer = self.writer.lock().unwrap();
+        (*writer).append(&entry)?;
+        let mut keydir = self.keydir.write().unwrap();
+        keydir.remove(&key);
         Ok(true)
     }
 }

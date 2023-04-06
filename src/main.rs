@@ -17,10 +17,15 @@ mod tests {
     use bytes::Bytes;
 
     #[test]
-    fn it_works() {
+    fn it_gets_none_for_empty() {
         let mut kv = KVContext::from_dir(Some(".test/data")).unwrap();
 
         assert_eq!(kv.get("empty".into()).unwrap(), None);
+    }
+
+    #[test]
+    fn it_sets_and_gets() {
+        let mut kv = KVContext::from_dir(Some(".test/data")).unwrap();
 
         let value = Bytes::from("value");
         kv.set("key".into(), value).unwrap();
@@ -31,6 +36,11 @@ mod tests {
             kv.get("key".into()).unwrap().unwrap(),
             Bytes::from("updated")
         );
+    }
+
+    #[test]
+    fn it_del() {
+        let mut kv = KVContext::from_dir(Some(".test/data")).unwrap();
 
         kv.set("new key".into(), Bytes::from("new val")).unwrap();
         assert_eq!(
