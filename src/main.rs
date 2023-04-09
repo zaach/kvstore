@@ -1,31 +1,40 @@
+mod cli;
 mod core;
 mod util;
+mod api;
 
-use crate::core::storage::{KVContext, KeyValueStorage};
+use crate::core::storage::KVContext;
+use clap::Parser;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut kv = KVContext::from_dir(Some(".kvstore/data")).unwrap();
-    kv.set("key".into(), "value".into()).unwrap();
-    let val = kv.get("key".into()).unwrap();
-    println!("val: {:?}", val);
+    let mut cli = crate::cli::Cli::parse();
+
+    let data_dir = cli.data_dir.take();
+
+    let storage = KVContext::from_dir(data_dir)?;
+
+    crate::cli::run(cli, storage)?;
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    //use super::*;
+    use crate::core::storage::{KVContext, KeyValueStorage};
     use bytes::Bytes;
+    use std::path::PathBuf;
 
     #[test]
     fn it_gets_none_for_empty() {
-        let mut kv = KVContext::from_dir(Some(".test/data")).unwrap();
+        let mut kv = KVContext::from_dir(Some(PathBuf::from(".test/data"))).unwrap();
 
         assert_eq!(kv.get("empty".into()).unwrap(), None);
     }
 
     #[test]
     fn it_sets_and_gets() {
-        let mut kv = KVContext::from_dir(Some(".test/data")).unwrap();
+        let mut kv = KVContext::from_dir(Some(PathBuf::from(".test/data"))).unwrap();
 
         let value = Bytes::from("value");
         kv.set("key".into(), value).unwrap();
@@ -40,7 +49,7 @@ mod tests {
 
     #[test]
     fn it_del() {
-        let mut kv = KVContext::from_dir(Some(".test/data")).unwrap();
+        let mut kv = KVContext::from_dir(Some(PathBuf::from(".test/data"))).unwrap();
 
         kv.set("new key".into(), Bytes::from("new val")).unwrap();
         assert_eq!(

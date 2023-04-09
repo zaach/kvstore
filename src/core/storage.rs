@@ -123,7 +123,7 @@ struct KeyDirEntry {
 }
 
 pub trait KeyValueStorage: Clone + Send + 'static {
-    type Error: std::error::Error;
+    type Error: std::error::Error + Send + Sync;
 
     fn set(&mut self, key: Bytes, value: Bytes) -> Result<(), Self::Error>;
 
@@ -141,14 +141,14 @@ pub struct KVContext {
     path: PathBuf,
 }
 
-const MAX_READER_CACHE: usize = 1024;
+const MAX_READER_CACHE: usize = 256;
 
 impl KVContext {
     pub fn new() -> Result<KVContext, Error> {
         KVContext::from_dir(None)
     }
 
-    pub fn from_dir(data_dir: Option<&str>) -> Result<KVContext, Error> {
+    pub fn from_dir(data_dir: Option<PathBuf>) -> Result<KVContext, Error> {
         let path = if let Some(p) = data_dir {
             // normalize relative path
             util::normalize_path(p)
