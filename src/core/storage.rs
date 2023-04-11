@@ -39,16 +39,12 @@ impl FileLogWriter {
             .create(true)
             .append(true)
             .open(path)?;
-        println!("FileLogWriter::new: path: {:?}", path);
         Ok(FileLogWriter { writer })
     }
 
     fn append<T: Serialize>(&mut self, entry: &T) -> Result<LogIndex, Error> {
-        println!("Serialized size: {:?}", bincode::serialized_size(entry)?);
         let buf = bincode::serialize(entry)?;
-        println!("buf: {:?}", buf);
         let len = buf.len() as u64;
-        println!("Writing size: {:?}", len);
         self.writer.write_all(&buf)?;
         self.writer.flush()?;
         let pos = self.writer.seek(SeekFrom::Current(0))? - len as u64;
@@ -64,19 +60,15 @@ struct FileLogReader {
 }
 impl FileLogReader {
     fn new(path: &str) -> Result<FileLogReader, Error> {
-        println!("FileLogReader::new: path: {:?}", path);
         let reader = std::fs::OpenOptions::new().read(true).open(path)?;
         Ok(FileLogReader { reader })
     }
 
     // TODO memmapped reader
     unsafe fn at<T: DeserializeOwned>(&mut self, len: u64, pos: u64) -> Result<T, Error> {
-        println!("FileLogReader::at: len: {:?}, pos: {:?}", len, pos);
         self.reader.seek(SeekFrom::Start(pos))?;
         let mut buf = vec![0; len as usize];
-        println!("buf len: {:?}", buf.len());
         self.reader.read_exact(&mut buf)?;
-        println!("buf: {:?}", buf);
         Ok(bincode::deserialize(&buf)?)
     }
 }
@@ -141,13 +133,9 @@ pub struct KVContext {
     path: PathBuf,
 }
 
-const MAX_READER_CACHE: usize = 256;
+const MAX_READER_CACHE: usize = 32;
 
 impl KVContext {
-    pub fn new() -> Result<KVContext, Error> {
-        KVContext::from_dir(None)
-    }
-
     pub fn from_dir(data_dir: Option<PathBuf>) -> Result<KVContext, Error> {
         let path = if let Some(p) = data_dir {
             // normalize relative path
@@ -155,7 +143,6 @@ impl KVContext {
         } else {
             std::env::current_dir()?.join(".kvstore/data")
         };
-        println!("path: {:?}", path);
         std::fs::create_dir_all(&path)?;
         let mut fileid = 0;
         let mut keydir = HashMap::new();
@@ -194,9 +181,6 @@ impl KVContext {
                 );
             }
         }
-
-        println!("fileid: {:?}", fileid);
-        println!("keydir: {:?}", keydir);
 
         let filepath = path.clone().join(fileid.to_string());
         let writer = Arc::new(Mutex::new(FileLogWriter::new(filepath.to_str().unwrap())?));

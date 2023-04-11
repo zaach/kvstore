@@ -3,6 +3,8 @@ use crate::core::storage::KeyValueStorage;
 use std::path::PathBuf;
 use bytes::Bytes;
 use crate::api;
+use std::io::{self, Write};
+
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -18,16 +20,13 @@ pub struct Cli {
 enum Commands {
     // Set a key-value pair
     Set {
-        #[arg(short, long)]
         key: Option<String>,
         value: Option<String>,
     },
     Get {
-        #[arg(short, long)]
         key: Option<String>,
     },
     Del {
-        #[arg(short, long)]
         key: Option<String>,
     },
     // Start server
@@ -49,7 +48,10 @@ pub fn run(cli: Cli, mut storage: impl KeyValueStorage + Sync) -> Result<(), Box
         }
         Some(Commands::Get { key }) => {
             if let Some(k) = key {
-                storage.get(Bytes::from(k.to_string()))?;
+                let val = storage.get(Bytes::from(k.to_string()))?;
+                if let Some(v) = val {
+                    io::stdout().write_all(&v)?;
+                }
             }
         }
         Some(Commands::Del { key }) => {
