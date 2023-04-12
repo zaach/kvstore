@@ -30,16 +30,24 @@ struct LogIndex {
     pos: u64,
 }
 
+const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
+
 struct FileLogWriter {
     writer: File,
+    fileid: u64,
+    filepos: u64,
 }
 impl FileLogWriter {
-    fn new(path: &str) -> Result<FileLogWriter, Error> {
+    fn new(path: &str, fileid: u64, filepos: u64) -> Result<FileLogWriter, Error> {
         let writer = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
-        Ok(FileLogWriter { writer })
+        Ok(FileLogWriter {
+            writer,
+            fileid,
+            filepos,
+        })
     }
 
     fn append<T: Serialize>(&mut self, entry: &T) -> Result<LogIndex, Error> {
@@ -48,10 +56,14 @@ impl FileLogWriter {
         self.writer.write_all(&buf)?;
         self.writer.flush()?;
         let pos = self.writer.seek(SeekFrom::Current(0))? - len as u64;
+        self.filepos = pos + len;
         Ok(LogIndex {
             len: len as u64,
             pos,
         })
+    }
+    fn serialized_size<T: Serialize>(entry: &T) -> Result<u64, Error> {
+        Ok(bincode::serialized_size(entry)?)
     }
 }
 
@@ -125,18 +137,17 @@ pub trait KeyValueStorage: Clone + Send + 'static {
 }
 
 #[derive(Clone)]
-pub struct KVContext {
+pub struct KvContext {
     logdir: LogDir,
     keydir: Arc<RwLock<KeyDir>>,
     writer: Arc<Mutex<FileLogWriter>>,
-    fileid: u64,
     path: PathBuf,
 }
 
 const MAX_READER_CACHE: usize = 32;
 
-impl KVContext {
-    pub fn from_dir(data_dir: Option<PathBuf>) -> Result<KVContext, Error> {
+impl KvContext {
+    pub fn from_dir(data_dir: Option<PathBuf>) -> Result<Self, Error> {
         let path = if let Some(p) = data_dir {
             // normalize relative path
             util::normalize_path(p)
@@ -145,6 +156,7 @@ impl KVContext {
         };
         std::fs::create_dir_all(&path)?;
         let mut fileid = 0;
+        let mut filepos = 0;
         let mut keydir = HashMap::new();
         let mut files = std::fs::read_dir(&path)?;
         while let Some(file) = files.next() {
@@ -160,7 +172,7 @@ impl KVContext {
             }
             let mut bufreader = std::io::BufReader::new(std::fs::File::open(p)?);
             while let Ok(entry) = bincode::deserialize_from::<_, DataFileEntry>(&mut bufreader) {
-                let len = bincode::serialized_size(&entry)?;
+                let len = FileLogWriter::serialized_size(&entry)?;
                 let key = entry.key;
                 let value = entry.value;
                 if value.is_none() {
@@ -169,6 +181,7 @@ impl KVContext {
                 }
                 let tstamp = entry.tstamp;
                 let pos = bufreader.seek(SeekFrom::Current(0))?;
+                filepos = pos;
                 let pos = pos - len;
                 keydir.insert(
                     key,
@@ -183,26 +196,45 @@ impl KVContext {
         }
 
         let filepath = path.clone().join(fileid.to_string());
-        let writer = Arc::new(Mutex::new(FileLogWriter::new(filepath.to_str().unwrap())?));
+        let writer = Arc::new(Mutex::new(FileLogWriter::new(
+            filepath.to_str().unwrap(),
+            fileid,
+            filepos,
+        )?));
 
         let logdir = LogDir::new();
 
-        Ok(KVContext {
+        Ok(Self {
             logdir,
             keydir: Arc::new(RwLock::new(keydir)),
             writer,
-            fileid,
             path,
         })
     }
 
+    fn write_entry(&self, writer: &mut FileLogWriter, entry: DataFileEntry) -> Result<(u64, u64, u64), Error> {
+        let entry_size = FileLogWriter::serialized_size(&entry)?;
+        if writer.filepos + entry_size > MAX_FILE_SIZE {
+            *writer = FileLogWriter::new(
+                self.path
+                    .clone()
+                    .join((writer.fileid + 1).to_string())
+                    .to_str()
+                    .unwrap(),
+                writer.fileid + 1,
+                0,
+            )?;
+        }
+        let index = (*writer).append(&entry)?;
+        Ok((writer.fileid, index.pos, index.len))
+    }
+
     // TODO compaction
+    // TODO hint files
 }
 
-impl KeyValueStorage for KVContext {
+impl KeyValueStorage for KvContext {
     type Error = AsStdError;
-
-    // TODO increase fileid when file size is too big
 
     fn set(&mut self, key: Bytes, value: Bytes) -> Result<(), Self::Error> {
         let tstamp = chrono::Utc::now().timestamp();
@@ -211,15 +243,17 @@ impl KeyValueStorage for KVContext {
             key: key.clone(),
             value: Some(value),
         };
+
         let mut writer = self.writer.lock().unwrap();
-        let index = (*writer).append(&entry)?;
+        let (fileid, pos, len) = self.write_entry(&mut writer, entry)?;
+
         let mut keydir = self.keydir.write().unwrap();
         keydir.insert(
             key,
             KeyDirEntry {
-                fileid: self.fileid,
-                len: index.len,
-                pos: index.pos,
+                fileid,
+                len,
+                pos,
                 tstamp,
             },
         );
@@ -254,9 +288,55 @@ impl KeyValueStorage for KVContext {
             value: None,
         };
         let mut writer = self.writer.lock().unwrap();
-        (*writer).append(&entry)?;
+        self.write_entry(&mut writer, entry)?;
         let mut keydir = self.keydir.write().unwrap();
         keydir.remove(&key);
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::path::PathBuf;
+
+    #[test]
+    fn it_gets_none_for_empty() {
+        let mut kv = KvContext::from_dir(Some(PathBuf::from(".test/data"))).unwrap();
+
+        assert_eq!(kv.get("empty".into()).unwrap(), None);
+    }
+
+    #[test]
+    fn it_sets_and_gets() {
+        let mut kv = KvContext::from_dir(Some(PathBuf::from(".test/data"))).unwrap();
+
+        let value = Bytes::from("value");
+        kv.set("key".into(), value).unwrap();
+        assert_eq!(kv.get("key".into()).unwrap().unwrap(), Bytes::from("value"));
+
+        kv.set("key".into(), Bytes::from("updated")).unwrap();
+        assert_eq!(
+            kv.get("key".into()).unwrap().unwrap(),
+            Bytes::from("updated")
+        );
+    }
+
+    #[test]
+    fn it_del() {
+        let mut kv = KvContext::from_dir(Some(PathBuf::from(".test/data"))).unwrap();
+
+        kv.set("new key".into(), Bytes::from("new val")).unwrap();
+        assert_eq!(
+            kv.get("new key".into()).unwrap().unwrap(),
+            Bytes::from("new val")
+        );
+        kv.del("new key".into()).unwrap();
+        assert_eq!(kv.get("new key".into()).unwrap(), None);
+
+        // remove the test directory
+        let test_dir = std::env::current_dir().unwrap().join(".test/data");
+        std::fs::remove_dir_all(test_dir).unwrap();
     }
 }
